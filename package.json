@@ -1,0 +1,7 @@
+{
+  "name": "athlete-safeguarding",
+  "private": true,
+  "scripts": {
+    "test": "node test_service.js"
+  }
+}
