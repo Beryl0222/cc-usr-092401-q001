@@ -165,8 +165,14 @@ class CallbackIdempotencyTest(unittest.TestCase):
         renamed = dict(self.callback)
         renamed["account"] = {"platform": "douyin", "account_key": "dy_hater_9",
                               "display_name": "改名后的账号名"}
-        response = self.app.platform_callback(renamed)
-        self.assertTrue(response["duplicate"])  # 同 callback_id：不重复处理改名
+        # 同 callback_id 但内容不同：明确冲突，不处理这次改名
+        with self.assertRaises(AppError) as ctx:
+            self.app.platform_callback(renamed)
+        self.assertEqual(ctx.exception.status, 409)
+        digest = self.app.incident_digest(self.incident_id)
+        self.assertEqual(digest["证据依据"]["linked_accounts"][0]["display_name"],
+                         "改名前的账号名")  # 冲突的改名未生效
+        # 新的 callback_id 承载新的改名处置结果
         new_cb = json.loads(json.dumps(self.callback))
         new_cb["callback_id"] = "CB-002"
         new_cb["account"]["display_name"] = "改名后的账号名"
@@ -355,22 +361,30 @@ class ClosureAndDigestTest(unittest.TestCase):
 
 
 class PersistenceTest(unittest.TestCase):
+    def _callback(self, status="processing"):
+        return {
+            "callback_id": "CB-PERSIST", "incident_id": self.incident_id,
+            "receipt": {"receipt_id": "R1", "platform": "douyin", "status": status}}
+
     def test_ledger_replay_restores_state_and_callback_idempotency(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "events.jsonl")
             app = SafeguardingApp(store_path=path)
-            incident_id = app.submit_report(abuse_report(), AGENT)["incident_id"]
-            app.platform_callback({
-                "callback_id": "CB-PERSIST", "incident_id": incident_id,
-                "receipt": {"receipt_id": "R1", "platform": "douyin", "status": "processing"}})
+            self.incident_id = app.submit_report(abuse_report(), AGENT)["incident_id"]
+            app.platform_callback(self._callback("processing"))
 
             reloaded = SafeguardingApp(store_path=path)
-            self.assertIn(incident_id, reloaded.incidents)
-            again = reloaded.platform_callback({
-                "callback_id": "CB-PERSIST", "incident_id": incident_id,
-                "receipt": {"receipt_id": "R1", "platform": "douyin", "status": "removed"}})
-            self.assertTrue(again["duplicate"])  # 重放后重复回调仍不二次处理
+            self.assertIn(self.incident_id, reloaded.incidents)
+            # 完全相同的重放：重放后仍判重，不二次处理
+            again = reloaded.platform_callback(self._callback("processing"))
+            self.assertTrue(again["duplicate"])
             self.assertEqual(len(reloaded.list_notifications()), 0)
+            # 同标识异内容在重放后同样被识别为冲突，且不落任何账
+            events_before = len(reloaded.store.replay())
+            with self.assertRaises(AppError) as ctx:
+                reloaded.platform_callback(self._callback("removed"))
+            self.assertEqual(ctx.exception.status, 409)
+            self.assertEqual(len(reloaded.store.replay()), events_before)
 
 
 class HttpContractTest(unittest.TestCase):
