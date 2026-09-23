@@ -165,8 +165,10 @@ class CallbackIdempotencyTest(unittest.TestCase):
         renamed = dict(self.callback)
         renamed["account"] = {"platform": "douyin", "account_key": "dy_hater_9",
                               "display_name": "改名后的账号名"}
-        response = self.app.platform_callback(renamed)
-        self.assertTrue(response["duplicate"])  # 同 callback_id：不重复处理改名
+        # 同一 callback_id 携带不同内容：明确冲突（409），不按成功重试处理
+        with self.assertRaises(AppError) as ctx:
+            self.app.platform_callback(renamed)
+        self.assertEqual(ctx.exception.status, 409)
         new_cb = json.loads(json.dumps(self.callback))
         new_cb["callback_id"] = "CB-002"
         new_cb["account"]["display_name"] = "改名后的账号名"
@@ -366,11 +368,18 @@ class PersistenceTest(unittest.TestCase):
 
             reloaded = SafeguardingApp(store_path=path)
             self.assertIn(incident_id, reloaded.incidents)
+            # 完全相同的重传：重放后仍返回首次结果，不二次处理
             again = reloaded.platform_callback({
                 "callback_id": "CB-PERSIST", "incident_id": incident_id,
-                "receipt": {"receipt_id": "R1", "platform": "douyin", "status": "removed"}})
-            self.assertTrue(again["duplicate"])  # 重放后重复回调仍不二次处理
+                "receipt": {"receipt_id": "R1", "platform": "douyin", "status": "processing"}})
+            self.assertTrue(again["duplicate"])
             self.assertEqual(len(reloaded.list_notifications()), 0)
+            # 同标识异内容：重启后依然判定冲突，而不是当成成功重试
+            with self.assertRaises(AppError) as ctx:
+                reloaded.platform_callback({
+                    "callback_id": "CB-PERSIST", "incident_id": incident_id,
+                    "receipt": {"receipt_id": "R1", "platform": "douyin", "status": "removed"}})
+            self.assertEqual(ctx.exception.status, 409)
 
 
 class HttpContractTest(unittest.TestCase):

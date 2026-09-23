@@ -5,11 +5,16 @@
 - 普通批评只登记线索、不立事件；直接人身威胁自动按值班规则升级且只通知一次；
 - 聚类只产生合并建议，须保护专员人工确认；
 - 报案/平台投诉/公开澄清按职责分离提交、分角色复核，禁止自复核；
-- 平台回调按 callback_id 幂等，重复回调不通知、不产生第二案件；
+- 平台回调按 callback_id 幂等：回执、内容状态、账号关系与已处理标记合为一条账本记录
+  原子提交，进程在任一写入点中断都可从账本恢复；完全相同的重传返回首次结果，
+  同标识异内容明确冲突（409）且不回显正文；迟到回调归入合并后的主事件责任链，
+  不重新打开已关闭/已合并事件；回调不通知、不产生第二案件；
 - 申诉期间限制敏感材料扩散并阻断对外动作；授权撤回不抹除责任链。
 """
 
 import hashlib
+import json
+import threading
 from datetime import datetime, timezone, timedelta
 
 from domain import load_config
@@ -60,6 +65,7 @@ class SafeguardingApp:
     def __init__(self, config=None, store_path=None):
         self.config = config or load_config()
         self.store = EventStore(store_path)
+        self._lock = threading.RLock()  # 串行化回调等多步写路径，并发同一幂等键只有一个胜者
         self.reports = {}            # report_no -> 线索记录
         self.incidents = {}          # incident_id -> 事件投影
         self.actions = {}            # action_id -> 动作记录
@@ -134,6 +140,7 @@ class SafeguardingApp:
             "content_sha256": sha,
             "severity": severity,
             "linked_accounts": payload.get("linked_accounts", []),
+            "receipts": report["receipts"],
             "received_at": report["received_at"],
         })
         self.reports[report_no] = report
@@ -212,7 +219,7 @@ class SafeguardingApp:
                 "submitter_role": p["submitter_role"], "victim_code": p["victim_code"],
                 "platform": p["platform"], "content_url": p["content_url"],
                 "content_sha256": p["content_sha256"], "severity": p["severity"],
-                "linked_accounts": p.get("linked_accounts", []), "receipts": [],
+                "linked_accounts": p.get("linked_accounts", []), "receipts": p.get("receipts", []),
                 "received_at": p["received_at"], "decision": None, "incident_id": None,
             }
 
@@ -424,8 +431,16 @@ class SafeguardingApp:
         self.notifications.append(p)
 
     def _on_callback_processed(self, p):
+        # 幂等索引与全部效果来自同一条账本记录：重放（含重启）后二者永不分离
         if p["callback_id"] not in self.callbacks:
-            self.callbacks[p["callback_id"]] = p["result"]
+            self.callbacks[p["callback_id"]] = {
+                "fingerprint": p.get("fingerprint"),
+                "result": p["result"],
+            }
+        for effect_type, effect_payload in p.get("effects", []):
+            handler = getattr(self, f"_on_{effect_type}", None)
+            if handler:
+                handler(effect_payload)
 
     # ------------------------------------------------------------- 严重度确认
     def confirm_severity(self, incident_id, severity, actor):
@@ -736,76 +751,118 @@ class SafeguardingApp:
         })
 
     # ------------------------------------------------------------------ 回调
+    @staticmethod
+    def _callback_fingerprint(payload):
+        """回调内容指纹：剔除幂等键后的规范化 JSON 的 SHA-256，用于识别同标识异内容。"""
+        content = {k: v for k, v in payload.items() if k != "callback_id"}
+        try:
+            canonical = json.dumps(content, ensure_ascii=False, sort_keys=True,
+                                   separators=(",", ":"))
+        except (TypeError, ValueError):
+            raise AppError("回调内容不是可序列化的 JSON 结构")
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
     def platform_callback(self, payload):
-        """平台/采集回调。以 callback_id 幂等：重复回调不通知、不产生第二案件。"""
+        """平台/采集回调。
+
+        - 回执、内容状态、账号关系与已处理标记合为一条账本记录原子提交：
+          要么共同生效，要么都不生效，进程在任一写入点中断都可从账本恢复；
+        - 完全相同的重传返回首次结果（duplicate=true），不产生第二次落账；
+        - 同一 callback_id 携带不同内容返回 409 冲突，错误信息只含标识、不回显正文；
+        - 并发回调由实例锁串行化，同一 callback_id 只有一个胜者；
+        - 回调不通知、不另立案件；已合并事件的迟到回调归到主事件责任链，
+          已关闭事件只追加记录、不重新打开。
+        """
         callback_id = payload.get("callback_id")
         if not callback_id:
             raise AppError("回调必须携带 callback_id")
-        if callback_id in self.callbacks:
-            first = self.callbacks[callback_id]
-            return {"duplicate": True, "callback_id": callback_id, **first}
+        fingerprint = self._callback_fingerprint(payload)
+        with self._lock:
+            known = self.callbacks.get(callback_id)
+            if known is not None:
+                if known["fingerprint"] is None or known["fingerprint"] == fingerprint:
+                    # 完全相同的重传（或无指纹的旧账本记录）：返回首次处理结果
+                    return {"duplicate": True, **known["result"]}
+                # 同标识异内容：明确冲突；错误信息只含幂等标识，不泄露回调正文
+                raise AppError(
+                    f"回调标识 {callback_id} 已处理过不同内容的回调，判定为冲突，本次内容未生效",
+                    409)
 
-        incident = self._resolve_callback_incident(payload)
-        if incident is None:
-            raise AppError("回调未匹配到既有事件，须先经当事人或授权代理报送立案", 404)
-        incident_id = incident["incident_id"]
-        at = now_iso()
-        attached = []
+            incident = self._resolve_callback_incident(payload)
+            if incident is None:
+                raise AppError("回调未匹配到既有事件，须先经当事人或授权代理报送立案", 404)
+            # 已合并事件的迟到回调归到主事件责任链；已关闭事件只追加、不重开
+            target = self._chain_survivor(incident)
+            at = now_iso()
+            effects, attached = self._plan_callback_effects(target, payload, at)
+            result = {"callback_id": callback_id,
+                      "incident_id": target["incident_id"], "attached": attached}
+            # 单条记录原子生效：重放时幂等索引与全部效果同源，永不出现半截状态
+            self._append("callback_processed", {
+                "callback_id": callback_id,
+                "incident_id": target["incident_id"],
+                "origin_incident_id": (incident["incident_id"]
+                                       if incident["incident_id"] != target["incident_id"]
+                                       else None),
+                "fingerprint": fingerprint,
+                "effects": effects,
+                "result": result,
+                "at": at,
+            })
+            return {"duplicate": False, **result}
+
+    def _plan_callback_effects(self, target, payload, at):
+        """纯计算回调的全部账本效果（回执/内容状态/账号关系），不触碰账本与投影。"""
+        group = self._merge_group(target)
+        effects, attached = [], []
 
         receipt = payload.get("receipt")
         if receipt and receipt.get("receipt_id"):
-            self._append("receipt_recorded", {
-                "incident_id": incident_id,
+            effects.append(("receipt_recorded", {
+                "incident_id": target["incident_id"],
                 "receipt_id": receipt["receipt_id"],
                 "platform": receipt.get("platform", payload.get("platform")),
                 "status": receipt.get("status"),
                 "reported_at": receipt.get("reported_at", at),
                 "via": "callback", "at": at,
-            })
+            }))
             attached.append("receipt")
             if receipt.get("status") == "removed":
-                evidence = self._evidence_for(incident, receipt.get("content_url"))
-                if evidence:
-                    self._append("content_state_changed", {
-                        "incident_id": incident_id, "evidence_id": evidence["evidence_id"],
+                found = self._evidence_in_group(group, receipt.get("content_url"))
+                if found and found[1]["state"] != "deleted":
+                    owner, evidence = found
+                    effects.append(("content_state_changed", {
+                        "incident_id": owner["incident_id"],
+                        "evidence_id": evidence["evidence_id"],
                         "old_state": evidence["state"], "new_state": "deleted",
                         "source": "platform_callback", "at": at,
-                    })
+                    }))
                     attached.append("content_deleted")
 
         account = payload.get("account")
         if account and account.get("account_key"):
-            matched = next((a for a in incident["accounts"]
-                            if a["platform"] == account.get("platform")
-                            and a["account_key"] == account["account_key"]), None)
+            matched = self._account_in_group(group, account, payload)
             if matched:
+                owner, acct = matched
                 new_name = account.get("display_name")
-                if new_name and new_name != matched["display_name"]:
-                    self._append("account_renamed", {
-                        "incident_id": incident_id,
-                        "platform": matched["platform"],
-                        "account_key": matched["account_key"],
-                        "old_name": matched["display_name"],
+                if new_name and new_name != acct["display_name"]:
+                    effects.append(("account_renamed", {
+                        "incident_id": owner["incident_id"],
+                        "platform": acct["platform"],
+                        "account_key": acct["account_key"],
+                        "old_name": acct["display_name"],
                         "new_name": new_name, "at": at,
-                    })
+                    }))
                     attached.append("account_renamed")
             else:
-                self._append("account_linked", {
-                    "incident_id": incident_id, "link_id": new_id("acct"),
+                effects.append(("account_linked", {
+                    "incident_id": target["incident_id"], "link_id": new_id("acct"),
                     "platform": account.get("platform", payload.get("platform")),
                     "account_key": account["account_key"], "url": account.get("url"),
                     "display_name": account.get("display_name"), "at": at,
-                })
+                }))
                 attached.append("account_linked")
-
-        # 回调附件不产生任何通知，也绝不另立案件
-        result = {"duplicate": False, "callback_id": callback_id,
-                  "incident_id": incident_id, "attached": attached}
-        stored = {k: v for k, v in result.items() if k != "duplicate"}
-        self.callbacks[callback_id] = stored
-        # 事件化记录，保证账本重放（含重启）后幂等索引仍然有效
-        self._append("callback_processed", {"callback_id": callback_id, "result": stored, "at": at})
-        return result
+        return effects, attached
 
     def _resolve_callback_incident(self, payload):
         explicit = payload.get("incident_id")
@@ -824,10 +881,51 @@ class SafeguardingApp:
                     return inc
         return None
 
-    def _evidence_for(self, incident, url):
+    def _chain_survivor(self, incident):
+        """沿 merged_into 找到责任链末端的主事件（合并只追加指针，不移动事实）。"""
+        current = incident
+        seen = {current["incident_id"]}
+        while current.get("merged_into"):
+            nxt = self.incidents.get(current["merged_into"])
+            if nxt is None or nxt["incident_id"] in seen:
+                break
+            current = nxt
+            seen.add(current["incident_id"])
+        return current
+
+    def _merge_group(self, incident):
+        """主事件连同其吸收的全部事件：迟到回调的证据/账号匹配范围。"""
+        group, stack, seen = [], [incident], set()
+        while stack:
+            current = stack.pop()
+            if current["incident_id"] in seen:
+                continue
+            seen.add(current["incident_id"])
+            group.append(current)
+            for absorbed_id in current.get("absorbed", []):
+                absorbed = self.incidents.get(absorbed_id)
+                if absorbed is not None:
+                    stack.append(absorbed)
+        return group
+
+    @staticmethod
+    def _evidence_in_group(group, url):
         if not url:
             return None
-        return next((e for e in incident["evidence"] if e["content_ref"] == url), None)
+        for inc in group:
+            for evidence in inc["evidence"]:
+                if evidence["content_ref"] == url:
+                    return inc, evidence
+        return None
+
+    @staticmethod
+    def _account_in_group(group, account, payload):
+        platform = account.get("platform", payload.get("platform"))
+        for inc in group:
+            for acct in inc["accounts"]:
+                if acct["platform"] == platform and acct["account_key"] == account["account_key"]:
+                    return inc, acct
+        return None
 
     # ------------------------------------------------------------------ 查询
     def _get_incident(self, incident_id):
@@ -951,8 +1049,25 @@ class SafeguardingApp:
         chain = []
         for event in self.store.replay():
             p = event["payload"]
-            if p.get("incident_id") in incident_ids or p.get("report_no") in wanted:
-                chain.append({"seq": event["seq"], "type": event["type"], "payload": p})
+            if p.get("report_no") in wanted:
+                chain.append({"seq": event["seq"], "type": event["type"], "payload": dict(p)})
+                continue
+            if event["type"] == "callback_processed":
+                if self._callback_event_incident_ids(p) & incident_ids:
+                    # 回调事务在责任链中展开为处理标记 + 逐项效果，便于还原处置过程
+                    chain.append({"seq": event["seq"], "type": event["type"], "payload": {
+                        "callback_id": p["callback_id"],
+                        "incident_id": p.get("incident_id"),
+                        "origin_incident_id": p.get("origin_incident_id"),
+                        "at": p.get("at"),
+                    }})
+                    for effect_type, effect_payload in p.get("effects", []):
+                        chain.append({"seq": event["seq"], "type": effect_type,
+                                      "payload": dict(effect_payload)})
+                continue
+            if p.get("incident_id") in incident_ids:
+                # 复制载荷再入链：脱敏改写只影响视图，不污染内存账本
+                chain.append({"seq": event["seq"], "type": event["type"], "payload": dict(p)})
         if mask:
             for item in chain:
                 p = item["payload"]
@@ -962,6 +1077,19 @@ class SafeguardingApp:
                 if "linked_accounts" in p:
                     p["linked_accounts"] = ["【申诉期间已限制】" for _ in p["linked_accounts"]]
         return chain
+
+    @staticmethod
+    def _callback_event_incident_ids(payload):
+        """回调事务记录触及的全部事件 id（含来源事件与各项效果）。"""
+        ids = set()
+        if payload.get("incident_id"):
+            ids.add(payload["incident_id"])
+        if payload.get("origin_incident_id"):
+            ids.add(payload["origin_incident_id"])
+        for _effect_type, effect_payload in payload.get("effects", []):
+            if effect_payload.get("incident_id"):
+                ids.add(effect_payload["incident_id"])
+        return ids
 
     def list_incidents(self, status=None, severity=None):
         out = []

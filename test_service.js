@@ -2,8 +2,8 @@
 
 const { spawnSync } = require("node:child_process");
 
-// 先做基础契约检查，再跑处置业务全链路；任一失败整体失败
-const suites = ["service_contract", "test_safeguarding"];
+// 先做基础契约检查，再跑处置业务全链路与回调韧性测试；任一失败整体失败
+const suites = ["service_contract", "test_safeguarding", "test_callback_resilience"];
 for (const suite of suites) {
   const result = spawnSync("python3", ["-m", "unittest", "-v", suite], { stdio: "inherit" });
   if (result.error) {
